@@ -120,5 +120,5 @@ token and relaunch the connector.
 
 ![img_8.png](static/img_8.png) 
 
-If you have any questions, contact us via [this form](https://app.any.run/contact-us/?utm_source=anyrungithub&utm_medium=documentation&utm_campaign=fortisiem&utm_content=linktocontactus) or write to [support@any.run](mailto:support@any.run) 
+If you have any questions, contact us via [this form](https://app.any.run/contact-us/?utm_source=anyrungithub&utm_medium=documentation&utm_campaign=fortisiem&utm_content=linktocontactus) or write to [techsupport@any.run](mailto:techsupport@any.run) 
  
