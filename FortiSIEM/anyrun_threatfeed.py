@@ -1,142 +1,295 @@
 #!/usr/bin/env python3.9
-# ANY.RUN Threatfeed Integration
+# Generic STIX2.1 Threatfeed Integration for ANY.RUN
+import re
 import argparse
-import traceback
-from datetime import datetime, timedelta
-from typing import Union
+from urllib.parse import urlsplit
 
-from utils.threatfeed_integration import (
+from fsiem_utils.threatfeed_integration import (
     ThreatfeedIntegration,
     IP_entry,
+    URL_entry,
     Domain_entry,
-    URL_entry
 )
-from anyrun.connectors import FeedsConnector
-from anyrun.iterators import FeedsIterator
-from anyrun import RunTimeException
+
+DEFAULT_TAXII_URLS = {
+    "ip": "https://api.any.run/v1/feeds/taxii2/api1/collections/55cda200-e261-5908-b910-f0e18909ef3d/objects",
+    "url": "https://api.any.run/v1/feeds/taxii2/api1/collections/05bfa343-e79f-57ec-8677-3122ca33d352/objects",
+    "site": "https://api.any.run/v1/feeds/taxii2/api1/collections/2e0aa90a-5526-5a43-84ad-3db6f4549a09/objects",
+}
+
+def resolve_tf_url(tf_type):
+    tf_url = DEFAULT_TAXII_URLS.get(tf_type)
+    if tf_url:
+        return tf_url
+
+    print(f"No hardcoded tfURL found for tfType={tf_type}. Update DEFAULT_TAXII_URLS.")
+    exit(1)
 
 
 class AnyRunThreatFeed(ThreatfeedIntegration):
-    """ Provides some methods to load ANY.RUN indicators to FortiSIEM """
-    def getThreatFeedData(self) -> None:
-        """ The connector entrypoint """
-        if self.threatfeed_username or not self.threatfeed_password:
-            print(
-                '[ANY.RUN] You must specify ANY.RUN TI Feeds Basic token in the password field. '
-                'Username is not required.'
-            )
+    # Supported FortiSIEM types in this script: ip, url, site (domain)
+    def getThreatFeedData(self):
+        if self.threatfeed_type not in {"ip", "url", "site"}:
+            print("Unsupported tfType for this script. Use only: ip, url, domain")
             exit(1)
 
-        with FeedsConnector(f'Basic {self.threatfeed_password}', integration='FortiSIEM:1.0.0') as connector:
-            try:
-                connector.check_authorization()
-                self._get_feeds(connector, {'url': 'url', 'ip': 'ip', 'site': 'domain'}.get(self.threatfeed_type))
-            except RunTimeException as exception:
-                print(str(exception))
-                exit(1)
-            except Exception:
-                print(f'Unspecified exception: {traceback.format_exc()}')
-                exit(1)
+        # Specify max age of data in days to retrieve
+        self.total_loaded_indicators = 0
+        self.getTAXIIFeed(90)
+        print(f"[ANY.RUN] Successfully loaded {self.total_loaded_indicators} indicators")
 
-    def _get_feeds(self, connector: FeedsConnector, feed_collection: str) -> None:
-        """
-        Loads ANY.RUN TI Feeds for the specified period. Then loads them to the FortiSIEM
+    def handleRequest(self, url, method="get", headers=None, params=None,
+                      auth=None, data=None, verify=True):
+        if headers is None:
+            headers = {}
+        else:
+            headers = dict(headers)
 
-        :param connector: ANY.RUN connector
-        :param feed_collection: TAXII STIX collection ID
-        """
-        if not feed_collection:
-            print(f"[ANY.RUN] Received invalid feed type: {self.threatfeed_type}. Use IP, URL, Domain.")
+        threatfeed_host = urlsplit(self.threatfeed_url).netloc
+        request_host = urlsplit(url).netloc
+        if threatfeed_host and request_host == threatfeed_host:
+            headers.setdefault("x-anyrun-connector", "FortiSIEM:1.0.0")
+
+        return super().handleRequest(url=url, method=method, headers=headers, params=params,
+                                     auth=auth, data=data, verify=verify)
+    
+    # _base_url is kept for compatibility with parent method signature
+    def getTaxii_v21Data(self, _base_url):
+        headers = {
+            "Accept": "application/taxii+json;version=2.1"
+        }
+
+        limit = 500
+        params = {
+            "limit": limit
+        }
+
+        if self.addedAfterTimeStamp is not None:
+            params['modified_after'] = self.addedAfterTimeStamp
+
+        obj_response = self.handleRequest(self.objects_url, headers=headers, params=params,
+                                          auth=self.threatfeed_basic_auth)
+        if obj_response.status_code == 301:
+            print(f"Getting objects URL {self.objects_url} failed -  requires redirection, exiting")
             exit(1)
+        if obj_response.status_code != 200:
+            print(f"Error in getting objects from URL {self.objects_url} - Status Code: {obj_response.status_code}")
+            exit(1)
+        data = obj_response.json()
+        objects = data.get('objects')
+        if objects is None or len(objects) == 0:
+            print("No threat entries found for the given URL")
+            exit()
 
-        feeds: list[Union[IP_entry, Domain_entry, URL_entry]] = []
-        for chunk in FeedsIterator.taxii_stix(
-            connector,
-            chunk_size=10000,
-            limit=10000,
-            match_revoked=False,
-            modified_after=(datetime.now() - timedelta(days=90)).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
-            match_version='all',
-            collection=feed_collection
-        ):
-            for feed in chunk:
-                if feed_collection == 'url':
-                    feeds.append(
-                        URL_entry(
-                            url=self._get_feed_value(feed),
-                            description=','.join(feed.get('labels')) if feed.get('labels') else '',
-                            lastSeen=feed.get('modified_after'),
-                            confidence=feed.get('confidence')
-                        ).get_dict()
-                    )
-                if feed_collection == 'ip':
-                    feeds.append(
+        self.processSTIXObjects(objects, self.taxii_collection)
+        has_more = data.get('more', False)
+        next_data = data.get('next')
+
+        while has_more is True and next_data is not None:
+            params['next'] = next_data
+
+            obj_response = self.handleRequest(self.objects_url, headers=headers, params=params,
+                                              auth=self.threatfeed_basic_auth)
+            if obj_response.status_code != 200:
+                print(f"Error in getting objects from page URL {self.objects_url}")
+                exit(1)
+
+            data = obj_response.json()
+            objects = data.get('objects')
+            if objects is None or len(objects) == 0:
+                print("No threat entries found for the given URL")
+                exit()
+
+            has_more = data.get('more', False)
+            next_data_updated = data.get('next', None)
+            self.processSTIXObjects(objects, self.taxii_collection)
+            if next_data == next_data_updated:
+                break
+            next_data = next_data_updated
+
+    # lastSeen is derived from STIX object.modified
+    def processSTIXObjects(self, objects, title):
+        if objects is None or len(objects) == 0:
+            print("Collection ", title, " has no threat entries")
+            return
+
+        url_pat = re.compile(r"^.*\[url:value = '(\S+)'.*\].*$")
+        ipv4_pat = re.compile(r"^.*\[ipv4-addr:value = '(\S+)'.*\].*$")
+        ipv6_pat = re.compile(r"^.*\[ipv6-addr:value = '(\S+)'.*\].*$")
+        domain_pat = re.compile(r"^.*\[domain-name:value = '(\S+)'.*\].*$")
+
+        parsed_data = []
+        for obj in objects:
+            pattern = obj.get('pattern')
+            if pattern is None:
+                continue
+
+            created = obj.get('created')
+            name = obj.get('name')
+            description = obj.get('description')
+            labels = obj.get('labels')
+            confidence = obj.get('confidence')
+            threat_types = obj.get('threatTypes', [])
+            threat_type_values = [t for t in threat_types if t]
+            last_seen_time = self.parse_timestamp(obj.get('modified'))
+
+            if description is not None and '\n' in description:
+                description = description.replace('\n', ' ')
+
+            if labels:
+                threat_type_values.extend([label for label in labels if label])
+
+            threat_type_str = ",".join(threat_type_values) if threat_type_values else None
+
+            if created is not None:
+                created = self.parse_timestamp(created)
+
+            if self.threatfeed_type == "ip":
+                match = ipv4_pat.match(pattern)
+                if match:
+                    ip = match.group(1)
+                    if not ip:
+                        continue
+                    if name is None:
+                        name = ip
+
+                    parsed_data.append(
                         IP_entry(
-                            name=self._get_feed_value(feed),
-                            low_ip=self._get_feed_value(feed),
-                            description=','.join(feed.get('labels')) if feed.get('labels') else '',
-                            lastSeen=feed.get('modified_after'),
-                            date_found=datetime.strptime(feed.get('created'), '%Y-%m-%dT%H:%M:%S.%fZ'),
-                            confidence=feed.get('confidence')
+                            name=name,
+                            low_ip=ip,
+                            high_ip=ip,
+                            description=description,
+                            malware_type=threat_type_str,
+                            confidence=confidence,
+                            lastSeen=last_seen_time,
+                            date_found=created,
                         ).get_dict()
                     )
-                if feed_collection == 'domain':
-                    feeds.append(
+                else:
+                    match = ipv6_pat.match(pattern)
+                    if match:
+                        ip = match.group(1)
+                        parsed_data.append(
+                            IP_entry(
+                                name=name,
+                                low_ip=ip,
+                                high_ip=ip,
+                                description=description,
+                                malware_type=threat_type_str,
+                                confidence=confidence,
+                                lastSeen=last_seen_time,
+                                date_found=created,
+                            ).get_dict()
+                        )
+            elif self.threatfeed_type == "url":
+                match = url_pat.match(pattern)
+                if match:
+                    url = match.group(1)
+                    parsed_data.append(
+                        URL_entry(
+                        url=url,
+                        malware_type=threat_type_str,
+                        confidence=confidence,
+                        lastSeen=last_seen_time,
+                    ).get_dict()
+                    )
+            elif self.threatfeed_type == "site":
+                match = domain_pat.match(pattern)
+                if match:
+                    domain = match.group(1)
+                    parsed_data.append(
                         Domain_entry(
-                            domainName=self._get_feed_value(feed),
-                            description=','.join(feed.get('labels')) if feed.get('labels') else '',
-                            lastSeen=feed.get('modified_after'),
-                            date_found=datetime.strptime(feed.get('created'), '%Y-%m-%dT%H:%M:%S.%fZ'),
-                            confidence=feed.get('confidence')
+                            domainName=domain,
+                            description=description,
+                            malware_type=threat_type_str,
+                            confidence=confidence,
+                            lastSeen=last_seen_time,
+                            date_found=created,
                         ).get_dict()
                     )
 
-            self.saveThreatFeedData(feeds)
-            print(f'[ANY.RUN] Successfully loaded {len(feeds)} indicators')
-            feeds.clear()
+        if len(parsed_data) > 0:
+            valid_entries = [entry for entry in parsed_data if entry is not None]
+            if len(valid_entries) > 0:
+                self.total_loaded_indicators += len(valid_entries)
+                self.saveThreatFeedData(valid_entries)
 
-        if 'chunk' not in locals():
-            print("[ANY.RUN] No feeds found in the last 90 days.")
 
+    def stripTAXIIURL(self, url: str) -> str:
+        parts = urlsplit(url)
+        self.taxii_params = {}
+        base_no_params = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        pat = re.compile(
+            r'^(?P<scheme>https?)://(?P<host>[^/]+)'
+            r'(?P<base>/.*?)/collections/(?P<collection>[^/]+)'
+            r'(?:/objects(?:/(?P<object>[^/?#]+))?)?/?$'
+        )
 
-    @staticmethod
-    def _get_feed_value(feed: dict) -> str:
-        """
-        Extracts indicator value from the pattern field
+        m = pat.match(base_no_params.rstrip('/'))
+        if not m:
+            raise ValueError(f"URL does not look like TAXII collections/objects: {url}")
 
-        :param feed: ANY.RUN indicator
-        :return: Indicator value
-        """
-        pattern = feed.get("pattern")
-        return pattern.split(" = '")[1][:-2]
+        self.taxii_proto = m.group("scheme")
+        self.taxii_server_hostname = m.group("host")
+        self.taxii_server_baseuri = m.group("base").lstrip('/')
+        self.taxii_collection = m.group("collection")
+        self.taxii_objectid = m.group("object")
+        self.objects_url = f"{self.taxii_proto}://{self.taxii_server_hostname}/{self.taxii_server_baseuri}/collections/{self.taxii_collection}/objects/"
+
+        discovery_url = f"{self.taxii_proto}://{self.taxii_server_hostname}/taxii2/"
+        match = re.match(r"(.*?/taxii2/)", url)
+        if match:
+            discovery_url = match.group(1)
+
+        return discovery_url
 
 
 if __name__ == '__main__':
-    arg_parser = argparse.ArgumentParser(description='Threatfeed integration')
-    arg_parser.add_argument('-updateType', required=True, action='store', type=str)
+    arg_parser = argparse.ArgumentParser(description='threatfeed integration')
+    arg_parser.add_argument('-updateType', default='full', action='store', type=str)
     arg_parser.add_argument('-appUser', default=None, action='store', type=str)
     arg_parser.add_argument('-appPW', default=None, action='store', type=str)
     arg_parser.add_argument('-appHost', default='https://127.0.0.1', action='store', type=str)
     arg_parser.add_argument('-naturalId', required=True, action='store', type=str)
-    arg_parser.add_argument('-tfType', required=True, action='store', type=str)
-    arg_parser.add_argument('-tfURL', required=True, action='store', type=str)
+    arg_parser.add_argument(
+        '-tfType',
+        required=True,
+        action='store',
+        type=str,
+        choices=['ip', 'url', 'site'],
+        help='Indicator type: ip, url, site (site = domain)',
+    )
+    # Kept for backward compatibility with existing launch templates; ignored by this script.
+    arg_parser.add_argument('-tfURL', required=False, default=None, action='store', type=str)
     arg_parser.add_argument('-tfUser', action='store', type=str)
     arg_parser.add_argument('-tfPW', action='store', type=str)
     arg_parser.add_argument('-sslVerify', default="true", action='store', type=str)
     args = arg_parser.parse_args()
+    tf_url = resolve_tf_url(args.tfType)
 
-    # Creating an instance of the AnyRunThreatFeed
-    threatfeed = AnyRunThreatFeed(
-        updateType=args.updateType,
-        naturalId=args.naturalId,
-        tfType=args.tfType,
-        tfURL=args.tfURL,
-        tfUser=args.tfUser,
-        tfPW=args.tfPW,
-        appUser=args.appUser,
-        appPW=args.appPW,
-        appHost=args.appHost,
-        sslVerify=args.sslVerify
-    )
+    if args.appUser and args.appPW:
+        threatfeed = AnyRunThreatFeed(
+            updateType=args.updateType,
+            naturalId=args.naturalId,
+            tfType=args.tfType,
+            tfURL=tf_url,
+            tfUser=args.tfUser,
+            tfPW=args.tfPW,
+            appUser=args.appUser,
+            appPW=args.appPW,
+            appHost=args.appHost,
+            sslVerify=args.sslVerify,
+        )
+    else:
+        threatfeed = AnyRunThreatFeed(
+            updateType=args.updateType,
+            naturalId=args.naturalId,
+            tfType=args.tfType,
+            tfURL=tf_url,
+            tfUser=args.tfUser,
+            tfPW=args.tfPW,
+            appHost=args.appHost,
+            sslVerify=args.sslVerify,
+        )
 
     threatfeed.getThreatFeedData()
