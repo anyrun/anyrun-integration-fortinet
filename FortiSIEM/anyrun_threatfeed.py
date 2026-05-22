@@ -3,13 +3,7 @@
 import re
 import argparse
 from urllib.parse import urlsplit
-
-from fsiem_utils.threatfeed_integration import (
-    ThreatfeedIntegration,
-    IP_entry,
-    URL_entry,
-    Domain_entry,
-)
+from fsiem_utils.threatfeed_integration import *
 
 DEFAULT_TAXII_URLS = {
     "ip": "https://api.any.run/v1/feeds/taxii2/api1/collections/55cda200-e261-5908-b910-f0e18909ef3d/objects",
@@ -39,7 +33,7 @@ class AnyRunThreatFeed(ThreatfeedIntegration):
         print(f"[ANY.RUN] Successfully loaded {self.total_loaded_indicators} indicators")
 
     def handleRequest(self, url, method="get", headers=None, params=None,
-                      auth=None, data=None, verify=True):
+                      auth=None, data=None, verify=True, **kwargs):
         if headers is None:
             headers = {}
         else:
@@ -245,26 +239,8 @@ class AnyRunThreatFeed(ThreatfeedIntegration):
 
 
 if __name__ == '__main__':
-    arg_parser = argparse.ArgumentParser(description='threatfeed integration')
-    arg_parser.add_argument('-updateType', default='full', action='store', type=str)
-    arg_parser.add_argument('-appUser', default=None, action='store', type=str)
-    arg_parser.add_argument('-appPW', default=None, action='store', type=str)
-    arg_parser.add_argument('-appHost', default='https://127.0.0.1', action='store', type=str)
-    arg_parser.add_argument('-naturalId', required=True, action='store', type=str)
-    arg_parser.add_argument(
-        '-tfType',
-        required=True,
-        action='store',
-        type=str,
-        choices=['ip', 'url', 'site'],
-        help='Indicator type: ip, url, site (site = domain)',
-    )
-    # Kept for backward compatibility with existing launch templates; ignored by this script.
-    arg_parser.add_argument('-tfURL', required=False, default=None, action='store', type=str)
-    arg_parser.add_argument('-tfUser', action='store', type=str)
-    arg_parser.add_argument('-tfPW', action='store', type=str)
-    arg_parser.add_argument('-sslVerify', default="true", action='store', type=str)
-    args = arg_parser.parse_args()
+    args = ThreatfeedIntegration.parseIntegrationArgs()
+    args.tfType = args.tfType.lower()
     tf_url = resolve_tf_url(args.tfType)
 
     if args.appUser and args.appPW:
